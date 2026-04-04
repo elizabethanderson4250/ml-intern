@@ -999,7 +999,16 @@ async def headless_main(
         elif event.event_type in ("turn_complete", "interrupted"):
             shimmer.stop()
             stream_buf.discard()
-            break
+            # Auto-continue: submit a follow-up message so the agent keeps working
+            _hl_sub_id[0] += 1
+            await submission_queue.put(Submission(
+                id=f"sub_{_hl_sub_id[0]}",
+                operation=Operation(
+                    op_type=OpType.USER_INPUT,
+                    data={"text": "Continue. You still have time remaining — check with `bash timer.sh`. Keep working until the task is fully complete."},
+                ),
+            ))
+            shimmer.start()
 
     # Shutdown
     shutdown_submission = Submission(
