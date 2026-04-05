@@ -7,6 +7,7 @@ dependency. In dev mode (no OAUTH_CLIENT_ID), auth is bypassed automatically.
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
 from dependencies import get_current_user
@@ -25,6 +26,7 @@ from models import (
     SessionInfo,
     SessionResponse,
     SubmitRequest,
+    TruncateRequest,
 )
 from session_manager import MAX_SESSIONS, SessionCapacityError, session_manager
 
@@ -205,13 +207,15 @@ async def create_session(
 
     Returns 503 if the server or user has reached the session limit.
     """
-    # Extract the user's HF token (Bearer header or HttpOnly cookie)
+    # Extract the user's HF token (Bearer header, HttpOnly cookie, or env var)
     hf_token = None
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         hf_token = auth_header[7:]
     if not hf_token:
         hf_token = request.cookies.get("hf_access_token")
+    if not hf_token:
+        hf_token = os.environ.get("HF_TOKEN")
 
     try:
         session_id = await session_manager.create_session(
@@ -433,6 +437,18 @@ async def undo_session(session_id: str, user: dict = Depends(get_current_user)) 
     if not success:
         raise HTTPException(status_code=404, detail="Session not found or inactive")
     return {"status": "undo_requested", "session_id": session_id}
+
+
+@router.post("/truncate/{session_id}")
+async def truncate_session(
+    session_id: str, body: TruncateRequest, user: dict = Depends(get_current_user)
+) -> dict:
+    """Truncate conversation to before a specific user message."""
+    _check_session_access(session_id, user)
+    success = await session_manager.truncate(session_id, body.user_message_index)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found, inactive, or message index out of range")
+    return {"status": "truncated", "session_id": session_id}
 
 
 @router.post("/compact/{session_id}")

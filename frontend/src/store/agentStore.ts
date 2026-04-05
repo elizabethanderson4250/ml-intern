@@ -50,7 +50,8 @@ export type ActivityStatus =
   | { type: 'thinking' }
   | { type: 'tool'; toolName: string; description?: string }
   | { type: 'waiting-approval' }
-  | { type: 'streaming' };
+  | { type: 'streaming' }
+  | { type: 'cancelled' };
 
 /** State that is tracked per-session (each session has its own copy). */
 export interface PerSessionState {
@@ -62,6 +63,8 @@ export interface PerSessionState {
   plan: PlanItem[];
   /** Steps completed by the research sub-agent (tool_log events). */
   researchSteps: string[];
+  /** Live stats from the research sub-agent. */
+  researchStats: { toolCount: number; tokenCount: number; startedAt: number | null; finalElapsed: number | null };
 }
 
 const defaultSessionState: PerSessionState = {
@@ -72,6 +75,7 @@ const defaultSessionState: PerSessionState = {
   panelEditable: false,
   plan: [],
   researchSteps: [],
+  researchStats: { toolCount: 0, tokenCount: 0, startedAt: null, finalElapsed: null },
 };
 
 interface AgentStore {
@@ -100,6 +104,15 @@ interface AgentStore {
 
   // Job URLs (tool_call_id -> job URL) for HF jobs
   jobUrls: Record<string, string>;
+
+  // Job statuses (tool_call_id -> job status) for HF jobs
+  jobStatuses: Record<string, string>;
+
+  // Tool error states (tool_call_id -> true if errored) - persisted across renders
+  toolErrors: Record<string, boolean>;
+
+  // Tool rejected states (tool_call_id -> true if rejected by user) - persisted across renders
+  rejectedTools: Record<string, boolean>;
 
   // ── Per-session actions ─────────────────────────────────────────────
 
@@ -138,6 +151,15 @@ interface AgentStore {
 
   setJobUrl: (toolCallId: string, jobUrl: string) => void;
   getJobUrl: (toolCallId: string) => string | undefined;
+
+  setJobStatus: (toolCallId: string, status: string) => void;
+  getJobStatus: (toolCallId: string) => string | undefined;
+
+  setToolError: (toolCallId: string, hasError: boolean) => void;
+  getToolError: (toolCallId: string) => boolean | undefined;
+
+  setToolRejected: (toolCallId: string, isRejected: boolean) => void;
+  getToolRejected: (toolCallId: string) => boolean | undefined;
 }
 
 /**
@@ -159,6 +181,44 @@ function syncSnapshot(
   };
 }
 
+// Load persisted tool errors from localStorage
+function loadToolErrors(): Record<string, boolean> {
+  try {
+    const stored = localStorage.getItem('hf-agent-tool-errors');
+    return stored ? JSON.parse(stored) : {};
+  } catch {
+    return {};
+  }
+}
+
+// Save tool errors to localStorage
+function saveToolErrors(errors: Record<string, boolean>): void {
+  try {
+    localStorage.setItem('hf-agent-tool-errors', JSON.stringify(errors));
+  } catch (e) {
+    console.warn('Failed to persist tool errors:', e);
+  }
+}
+
+// Load persisted rejected tools from localStorage
+function loadRejectedTools(): Record<string, boolean> {
+  try {
+    const stored = localStorage.getItem('hf-agent-rejected-tools');
+    return stored ? JSON.parse(stored) : {};
+  } catch {
+    return {};
+  }
+}
+
+// Save rejected tools to localStorage
+function saveRejectedTools(rejected: Record<string, boolean>): void {
+  try {
+    localStorage.setItem('hf-agent-rejected-tools', JSON.stringify(rejected));
+  } catch (e) {
+    console.warn('Failed to persist rejected tools:', e);
+  }
+}
+
 export const useAgentStore = create<AgentStore>()((set, get) => ({
   sessionStates: {},
   activeSessionId: null,
@@ -178,6 +238,9 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
 
   editedScripts: {},
   jobUrls: {},
+  jobStatuses: {},
+  toolErrors: loadToolErrors(),
+  rejectedTools: loadRejectedTools(),
 
   // ── Per-session state management ──────────────────────────────────
 
@@ -189,7 +252,7 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
     // Apply the processing→idle side effect
     const processingCleared = 'isProcessing' in updates && !updates.isProcessing;
     if (processingCleared) {
-      if (updated.activityStatus.type !== 'waiting-approval') {
+      if (updated.activityStatus.type !== 'waiting-approval' && updated.activityStatus.type !== 'cancelled') {
         updated.activityStatus = { type: 'idle' };
       }
     }
@@ -237,6 +300,7 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
         panelEditable: state.panelEditable,
         plan: state.plan,
         researchSteps: state.sessionStates[state.activeSessionId]?.researchSteps ?? [],
+        researchStats: state.sessionStates[state.activeSessionId]?.researchStats ?? defaultSessionState.researchStats,
       };
     }
 
@@ -267,7 +331,7 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
 
   setProcessing: (isProcessing) => {
     const current = get().activityStatus;
-    const preserveStatus = current.type === 'waiting-approval';
+    const preserveStatus = current.type === 'waiting-approval' || current.type === 'cancelled';
     set({ isProcessing, ...(!isProcessing && !preserveStatus ? { activityStatus: { type: 'idle' } } : {}) });
   },
   setConnected: (isConnected) => set({ isConnected }),
@@ -349,4 +413,38 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   },
 
   getJobUrl: (toolCallId) => get().jobUrls[toolCallId],
+
+  // ── Job Statuses ────────────────────────────────────────────────────
+
+  setJobStatus: (toolCallId, status) => {
+    set((state) => ({
+      jobStatuses: { ...state.jobStatuses, [toolCallId]: status },
+    }));
+  },
+
+  getJobStatus: (toolCallId) => get().jobStatuses[toolCallId],
+
+  // ── Tool Errors ─────────────────────────────────────────────────────
+
+  setToolError: (toolCallId, hasError) => {
+    set((state) => {
+      const updated = { ...state.toolErrors, [toolCallId]: hasError };
+      saveToolErrors(updated);
+      return { toolErrors: updated };
+    });
+  },
+
+  getToolError: (toolCallId) => get().toolErrors[toolCallId],
+
+  // ── Tool Rejections ──────────────────────────────────────────────────
+
+  setToolRejected: (toolCallId, isRejected) => {
+    set((state) => {
+      const updated = { ...state.rejectedTools, [toolCallId]: isRejected };
+      saveRejectedTools(updated);
+      return { rejectedTools: updated };
+    });
+  },
+
+  getToolRejected: (toolCallId) => get().rejectedTools[toolCallId],
 }));

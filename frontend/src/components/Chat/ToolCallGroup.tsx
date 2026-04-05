@@ -10,6 +10,7 @@ import BlockIcon from '@mui/icons-material/Block';
 import { useAgentStore } from '@/store/agentStore';
 import { useLayoutStore } from '@/store/layoutStore';
 import { logger } from '@/utils/logger';
+import { RESEARCH_MAX_STEPS } from '@/lib/research-store';
 import type { UIMessage } from 'ai';
 
 // ---------------------------------------------------------------------------
@@ -35,37 +36,153 @@ interface ToolCallGroupProps {
 // Research sub-steps (inline under the research tool row)
 // ---------------------------------------------------------------------------
 
-/** Pretty labels for research sub-agent tool calls */
-function formatResearchStep(step: string): { icon: string; label: string } {
-  if (step === 'Starting research sub-agent...') return { icon: '🔍', label: 'Starting research' };
-  if (step === 'Research complete.') return { icon: '✓', label: 'Research complete' };
-  if (step.startsWith('github_find_examples')) return { icon: '📂', label: step.replace('github_find_examples', 'Finding examples') };
-  if (step.startsWith('github_read_file')) {
-    const path = step.match(/\(([^)]+)\)/)?.[1] || '';
-    const filename = path.split('/').pop() || path;
-    return { icon: '📄', label: `Reading ${filename}` };
-  }
-  if (step.startsWith('explore_hf_docs')) return { icon: '📚', label: step.replace('explore_hf_docs', 'Exploring docs') };
-  if (step.startsWith('fetch_hf_docs')) return { icon: '📖', label: step.replace('fetch_hf_docs', 'Fetching docs') };
-  if (step.startsWith('hf_inspect_dataset')) return { icon: '🗃️', label: step.replace('hf_inspect_dataset', 'Inspecting dataset') };
-  if (step.startsWith('hf_papers')) return { icon: '📑', label: 'Searching papers' };
-  if (step.startsWith('find_hf_api')) return { icon: '🔌', label: 'Finding API endpoints' };
-  if (step.startsWith('hf_repo_files')) return { icon: '📁', label: 'Reading repo files' };
-  return { icon: '→', label: step };
+/** Hook that ticks every second while startedAt is set, returning elapsed seconds. */
+function useElapsed(startedAt: number | null): number | null {
+  const [elapsed, setElapsed] = useState<number | null>(null);
+  useEffect(() => {
+    if (startedAt === null) { setElapsed(null); return; }
+    setElapsed(Math.round((Date.now() - startedAt) / 1000));
+    const id = setInterval(() => setElapsed(Math.round((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [startedAt]);
+  return elapsed;
 }
 
+/** Format token count like the CLI: "12.4k" or "800". */
+function formatTokens(tokens: number): string {
+  return tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens);
+}
+
+/** Format elapsed seconds like the CLI: "18s" or "2m 5s". */
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+/** Build the research stats chip label. */
+function researchChipLabel(
+  stats: { toolCount: number; tokenCount: number; startedAt: number | null; finalElapsed: number | null },
+  liveElapsed: number | null,
+): string | null {
+  const elapsed = stats.finalElapsed ?? liveElapsed;
+  if (elapsed === null && stats.toolCount === 0) return null;
+  const parts: string[] = [];
+  if (stats.startedAt !== null) parts.push('running');
+  if (stats.toolCount > 0) parts.push(`${stats.toolCount} tools`);
+  if (stats.tokenCount > 0) parts.push(`${formatTokens(stats.tokenCount)} tokens`);
+  if (elapsed !== null) parts.push(formatElapsed(elapsed));
+  return parts.join(' \u00B7 ');
+}
+
+/** Parse JSON args from a step string like "tool_name  {json}" (may be truncated at 80 chars). */
+function parseStepArgs(step: string): Record<string, string> {
+  const jsonStart = step.indexOf('{');
+  if (jsonStart < 0) return {};
+  const jsonStr = step.slice(jsonStart);
+  try {
+    const parsed = JSON.parse(jsonStr);
+    const result: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === 'string') result[k] = v;
+    }
+    return result;
+  } catch {
+    // JSON likely truncated — extract key-value pairs via regex
+    const result: Record<string, string> = {};
+    // Match complete "key": "value" pairs
+    for (const m of jsonStr.matchAll(/"(\w+)":\s*"([^"]*)"/g)) {
+      result[m[1]] = m[2];
+    }
+    // Match truncated trailing value: "key": "value... (no closing quote)
+    if (Object.keys(result).length === 0 || !result.query) {
+      const trunc = jsonStr.match(/"(\w+)":\s*"([^"]+)$/);
+      if (trunc && !result[trunc[1]]) {
+        result[trunc[1]] = trunc[2];
+      }
+    }
+    return result;
+  }
+}
+
+/** Pretty labels for research sub-agent tool calls */
+function formatResearchStep(raw: string): { label: string } {
+  // Backend sends logs like "▸ tool_name  {args}" — strip the prefix
+  const step = raw.replace(/^▸\s*/, '');
+  const args = parseStepArgs(step);
+
+  if (step.startsWith('github_find_examples')) {
+    const detail = (args.keyword) || (args.repo);
+    return { label: detail ? `Finding examples: ${detail}` : 'Finding examples' };
+  }
+  if (step.startsWith('github_read_file')) {
+    const path = (args.path) || '';
+    const filename = path.split('/').pop() || path;
+    return { label: filename ? `Reading ${filename}` : 'Reading file' };
+  }
+  if (step.startsWith('explore_hf_docs')) {
+    const endpoint = (args.endpoint) || (args.query);
+    return { label: endpoint ? `Exploring docs: ${endpoint}` : 'Exploring docs' };
+  }
+  if (step.startsWith('fetch_hf_docs')) {
+    const url = (args.url) || '';
+    const page = url.split('/').pop()?.replace(/\.md$/, '');
+    return { label: page ? `Reading docs: ${page}` : 'Fetching docs' };
+  }
+  if (step.startsWith('hf_inspect_dataset')) {
+    const dataset = (args.dataset);
+    return { label: dataset ? `Inspecting dataset: ${dataset}` : 'Inspecting dataset' };
+  }
+  if (step.startsWith('hf_papers')) {
+    const op = args.operation as string;
+    const detail = (args.query) || (args.arxiv_id);
+    const opLabels: Record<string, string> = {
+      trending: 'Browsing trending papers',
+      search: 'Searching papers',
+      paper_details: 'Reading paper details',
+      read_paper: 'Reading paper',
+      citation_graph: 'Tracing citations',
+      snippet_search: 'Searching paper snippets',
+      recommend: 'Finding related papers',
+      find_datasets: 'Finding paper datasets',
+      find_models: 'Finding paper models',
+      find_collections: 'Finding paper collections',
+      find_all_resources: 'Finding paper resources',
+    };
+    const base = (op && opLabels[op]) || 'Searching papers';
+    return { label: detail ? `${base}: ${detail}` : base };
+  }
+  if (step.startsWith('find_hf_api')) {
+    const detail = (args.query) || (args.tag);
+    return { label: detail ? `Finding API: ${detail}` : 'Finding API endpoints' };
+  }
+  if (step.startsWith('hf_repo_files')) {
+    const repo = (args.repo_id) || (args.repo);
+    return { label: repo ? `Reading ${repo} files` : 'Reading repo files' };
+  }
+  if (step.startsWith('read')) {
+    const path = (args.path) || '';
+    const filename = path.split('/').pop();
+    return { label: filename ? `Reading ${filename}` : 'Reading file' };
+  }
+  if (step.startsWith('bash')) {
+    const cmd = args.command as string;
+    const short = cmd && cmd.length > 40 ? cmd.slice(0, 40) + '...' : cmd;
+    return { label: short ? `Running: ${short}` : 'Running command' };
+  }
+  return { label: step.replace(/^▸\s*/, '') };
+}
+
+/** Rolling 2-line display of research sub-tool calls — hidden when complete. */
 function ResearchSteps({ steps, isRunning }: { steps: string[]; isRunning: boolean }) {
-  // Filter out the "Starting..." and "complete" meta-steps for the list
-  const toolSteps = steps.filter(
-    s => s !== 'Starting research sub-agent...' && s !== 'Research complete.',
-  );
-  if (toolSteps.length === 0) return null;
+  if (!isRunning) return null;
+  const visible = steps.slice(-RESEARCH_MAX_STEPS);
+  if (visible.length === 0) return null;
 
   return (
     <Box sx={{ pl: 4.5, pr: 1.5, pb: 1, pt: 0.25 }}>
-      {toolSteps.map((step, i) => {
-        const { icon, label } = formatResearchStep(step);
-        const isLast = i === toolSteps.length - 1;
+      {visible.map((step, i) => {
+        const { label } = formatResearchStep(step);
+        const isLast = i === visible.length - 1;
         return (
           <Stack
             key={i}
@@ -74,17 +191,16 @@ function ResearchSteps({ steps, isRunning }: { steps: string[]; isRunning: boole
             spacing={0.75}
             sx={{ py: 0.2 }}
           >
-            <Typography sx={{ fontSize: '0.65rem', lineHeight: 1, width: 14, textAlign: 'center', flexShrink: 0 }}>
-              {isLast && isRunning ? '' : icon}
-            </Typography>
-            {isLast && isRunning && (
+            {isLast ? (
               <CircularProgress size={10} thickness={5} sx={{ color: 'var(--accent-yellow)', flexShrink: 0 }} />
+            ) : (
+              <CheckCircleOutlineIcon sx={{ fontSize: 12, color: 'var(--muted-text)', flexShrink: 0 }} />
             )}
             <Typography
               sx={{
                 fontFamily: '"JetBrains Mono", ui-monospace, SFMono-Regular, monospace',
                 fontSize: '0.68rem',
-                color: isLast && isRunning ? 'var(--text)' : 'var(--muted-text)',
+                color: isLast ? 'var(--text)' : 'var(--muted-text)',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
@@ -132,8 +248,8 @@ function costLabel(hardware: string): string | null {
 // Visual helpers
 // ---------------------------------------------------------------------------
 
-function StatusIcon({ state, cancelled }: { state: ToolPartState; cancelled?: boolean }) {
-  if (cancelled) {
+function StatusIcon({ state, cancelled, isRejected }: { state: ToolPartState; cancelled?: boolean; isRejected?: boolean }) {
+  if (cancelled || isRejected) {
     return <BlockIcon sx={{ fontSize: 16, color: 'var(--muted-text)' }} />;
   }
   switch (state) {
@@ -397,11 +513,17 @@ function InlineApproval({
 // ---------------------------------------------------------------------------
 
 export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProps) {
-  const { setPanel, lockPanel, getJobUrl, getEditedScript } = useAgentStore();
+  const { setPanel, lockPanel, getJobUrl, getEditedScript, setJobStatus, getJobStatus, setToolError, getToolError, setToolRejected, getToolRejected } = useAgentStore();
   const researchSteps = useAgentStore(s => {
     const activeId = s.activeSessionId;
     return activeId ? (s.sessionStates[activeId]?.researchSteps) : undefined;
   }) ?? EMPTY_STEPS;
+  const researchStats = useAgentStore(s => {
+    const activeId = s.activeSessionId;
+    return activeId ? s.sessionStates[activeId]?.researchStats : undefined;
+  }) ?? { toolCount: 0, tokenCount: 0, startedAt: null, finalElapsed: null };
+  const liveElapsed = useElapsed(researchStats.startedAt);
+  const isProcessing = useAgentStore(s => s.isProcessing);
   const { setRightPanelOpen, setLeftSidebarOpen } = useLayoutStore();
 
   // ── Batch approval state ──────────────────────────────────────────
@@ -417,6 +539,9 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
   // Track which toolCallIds we've already submitted so we can detect new approval rounds
   const submittedIdsRef = useRef<Set<string>>(new Set());
 
+  // ── Panel lock state (for auto-follow vs user-selected) ───────────
+  const [lockedToolId, setLockedToolId] = useState<string | null>(null);
+
   // Reset submission state when new (unseen) pending tools arrive — e.g. second approval round
   useEffect(() => {
     if (!isSubmitting || pendingTools.length === 0) return;
@@ -427,6 +552,35 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       setDecisions({});
     }
   }, [pendingTools, isSubmitting]);
+
+  // Clean up stale decisions for tools that are no longer pending
+  useEffect(() => {
+    const pendingIds = new Set(pendingTools.map(t => t.toolCallId));
+    const decisionIds = Object.keys(decisions);
+    const hasStale = decisionIds.some(id => !pendingIds.has(id));
+    if (hasStale) {
+      setDecisions(prev => {
+        const cleaned = { ...prev };
+        for (const id of decisionIds) {
+          if (!pendingIds.has(id)) delete cleaned[id];
+        }
+        return cleaned;
+      });
+    }
+  }, [pendingTools, decisions]);
+
+  // Persist error states when tools error
+  useEffect(() => {
+    for (const tool of tools) {
+      const currentlyHasError = tool.state === 'output-error';
+      const persistedError = getToolError(tool.toolCallId);
+
+      // Persist error state if we detect it and haven't already
+      if (currentlyHasError && !persistedError) {
+        setToolError(tool.toolCallId, true);
+      }
+    }
+  }, [tools, setToolError, getToolError]);
 
   const { scriptLabelMap, toolDisplayMap } = useMemo(() => {
     const hfJobs = tools.filter(t => t.toolName === 'hf_jobs' && (t.input as Record<string, unknown>)?.script);
@@ -463,6 +617,10 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         if (editedScript) {
           logger.log(`Sending edited script for ${toolCallId} (${editedScript.length} chars)`);
         }
+        // Mark tool as rejected if not approved
+        if (!d.approved) {
+          setToolRejected(toolCallId, true);
+        }
         return {
           tool_call_id: toolCallId,
           approved: d.approved,
@@ -482,7 +640,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         setIsSubmitting(false);
       }
     },
-    [approveTools, lockPanel, getEditedScript],
+    [approveTools, lockPanel, getEditedScript, setToolRejected],
   );
 
   const handleApproveAll = useCallback(() => {
@@ -518,8 +676,8 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     });
   }, []);
 
-  // ── Panel click handler ───────────────────────────────────────────
-  const handleClick = useCallback(
+  // ── Show tool panel (shared logic) ────────────────────────────────
+  const showToolPanel = useCallback(
     (tool: DynamicToolPart) => {
       const args = tool.input as Record<string, unknown> | undefined;
       const displayName = toolDisplayMap[tool.toolCallId] || tool.toolName;
@@ -545,7 +703,13 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       const inputSection = args ? { content: JSON.stringify(args, null, 2), language: 'json' } : undefined;
 
       const outputText = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
-      if ((tool.state === 'output-available' || tool.state === 'output-error') && outputText) {
+
+      // Determine if tool is still running or has completed
+      const isRunning = tool.state === 'input-available' || tool.state === 'input-streaming' || tool.state === 'approval-responded';
+      const hasCompleted = tool.state === 'output-available' || tool.state === 'output-error' || tool.state === 'output-denied';
+
+      if (outputText) {
+        // Tool has output - show it (regardless of state)
         let language = 'text';
         const content = String(outputText);
         if (content.trim().startsWith('{') || content.trim().startsWith('[')) language = 'json';
@@ -557,13 +721,78 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         const content = `Tool \`${tool.toolName}\` returned an error with no output message.`;
         setPanel({ title: displayName, output: { content, language: 'markdown' }, input: inputSection }, 'output');
         setRightPanelOpen(true);
-      } else if (args) {
+      } else if (hasCompleted && args) {
+        // Tool completed but has no output - show input as fallback
         setPanel({ title: displayName, output: { content: JSON.stringify(args, null, 2), language: 'json' }, input: inputSection }, 'output');
+        setRightPanelOpen(true);
+      } else if (isRunning && args) {
+        // Tool is still running - show running message
+        const content = `Tool \`${tool.toolName}\` is still running...\n\nClick the input tab to view the tool arguments.`;
+        setPanel({ title: displayName, output: { content, language: 'markdown' }, input: inputSection }, 'output');
+        setRightPanelOpen(true);
+      } else if (args) {
+        const runningMessages = [
+          'Crunching numbers and herding tensors...',
+          'Teaching the model some new tricks...',
+          'Consulting the GPU oracle...',
+          'Wrangling data into submission...',
+          'Brewing a fresh batch of predictions...',
+          'Negotiating with the transformer heads...',
+          'Polishing the attention weights...',
+          'Aligning the embedding stars...',
+        ];
+        const funMsg = runningMessages[Math.floor(Math.random() * runningMessages.length)];
+        setPanel({ title: displayName, output: { content: funMsg, language: 'text' }, input: inputSection }, 'output');
         setRightPanelOpen(true);
       }
     },
     [toolDisplayMap, setPanel, getEditedScript, setRightPanelOpen, setLeftSidebarOpen],
   );
+
+  // ── Panel click handler ───────────────────────────────────────────
+  const handleClick = useCallback(
+    (tool: DynamicToolPart) => {
+      // Toggle lock: if clicking the same tool that's already locked, unlock it
+      if (lockedToolId === tool.toolCallId) {
+        setLockedToolId(null);
+        return;
+      }
+
+      // Lock this tool
+      setLockedToolId(tool.toolCallId);
+
+      // Show the panel
+      showToolPanel(tool);
+    },
+    [lockedToolId, showToolPanel],
+  );
+
+  // ── Auto-follow currently active tool when not locked ─────────────
+  const activeToolIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (lockedToolId !== null) return; // User has locked a tool, don't auto-follow
+
+    // Find the currently running tool (latest tool that's in progress)
+    const runningTool = tools.slice().reverse().find(t =>
+      t.state === 'input-available' ||
+      t.state === 'input-streaming' ||
+      t.state === 'approval-responded'
+    );
+
+    if (runningTool) {
+      // Track this as the active tool and show its panel
+      activeToolIdRef.current = runningTool.toolCallId;
+      showToolPanel(runningTool);
+    } else if (activeToolIdRef.current) {
+      // No running tool, but we were following one - check if it completed
+      const completedTool = tools.find(t => t.toolCallId === activeToolIdRef.current);
+      if (completedTool && (completedTool.state === 'output-available' || completedTool.state === 'output-error')) {
+        // The tool we were following has completed - update its panel
+        showToolPanel(completedTool);
+      }
+    }
+  }, [tools, lockedToolId, showToolPanel]);
 
   // ── Parse hf_jobs metadata from output ────────────────────────────
   function parseJobMeta(output: unknown): { jobUrl?: string; jobStatus?: string } {
@@ -651,25 +880,46 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
           const clickable =
             state === 'output-available' ||
             state === 'output-error' ||
-            !!tool.input;
+            !!tool.input ||
+            (!isProcessing && (state === 'input-available' || state === 'input-streaming'));
           const localDecision = decisions[tool.toolCallId];
 
           const cancelled = isCancelledTool(tool);
-          const displayState = isPending && localDecision
-            ? (localDecision.approved ? 'input-available' : 'output-denied')
-            : state;
-          const label = cancelled ? 'cancelled' : statusLabel(displayState as ToolPartState);
+          const currentlyHasError = state === 'output-error';
+          const persistedError = getToolError(tool.toolCallId);
+          const persistedRejection = getToolRejected(tool.toolCallId);
+
+          // Stale in-progress tools after page reload: treat as completed
+          const stale = !isProcessing && (state === 'input-available' || state === 'input-streaming');
+          const displayState = stale ? 'output-available'
+            : isPending && localDecision
+              ? (localDecision.approved ? 'input-available' : 'output-denied')
+              : state;
+          const isRejected = displayState === 'output-denied' || persistedRejection;
+          const hasError = (persistedError || currentlyHasError) && !isRejected;
+          const label = cancelled ? 'cancelled'
+            : isRejected ? 'rejected'
+            : hasError ? 'error'
+            : statusLabel(displayState as ToolPartState);
 
           // Parse job metadata from hf_jobs output and store
           const jobUrlFromStore = tool.toolName === 'hf_jobs' ? getJobUrl(tool.toolCallId) : undefined;
-          const jobMetaFromOutput = tool.toolName === 'hf_jobs' && tool.state === 'output-available'
-            ? parseJobMeta(tool.output)
+          const jobStatusFromStore = tool.toolName === 'hf_jobs' ? getJobStatus(tool.toolCallId) : undefined;
+
+          const jobMetaFromOutput = tool.toolName === 'hf_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)
+            ? parseJobMeta(tool.output ?? (tool as Record<string, unknown>).errorText)
             : {};
-          
-          // Combine job URL from store (available immediately) with output metadata (available at completion)
+
+          // Store job status if we just parsed it and don't have it stored yet
+          if (tool.toolName === 'hf_jobs' && jobMetaFromOutput.jobStatus && !jobStatusFromStore) {
+            setJobStatus(tool.toolCallId, jobMetaFromOutput.jobStatus);
+          }
+
+          // Combine job URL and status from store (persisted) with output metadata (freshly parsed)
+          // Prefer stored values to ensure they persist across renders
           const jobMeta = {
             jobUrl: jobUrlFromStore || jobMetaFromOutput.jobUrl,
-            jobStatus: jobMetaFromOutput.jobStatus,
+            jobStatus: jobStatusFromStore || jobMetaFromOutput.jobStatus,
           };
 
           return (
@@ -685,15 +935,20 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   py: 1,
                   cursor: isPending ? 'default' : clickable ? 'pointer' : 'default',
                   transition: 'background-color 0.15s',
+                  bgcolor: lockedToolId === tool.toolCallId ? 'var(--hover-bg)' : 'transparent',
+                  borderLeft: lockedToolId === tool.toolCallId ? '3px solid var(--accent-yellow)' : '3px solid transparent',
                   '&:hover': clickable && !isPending ? { bgcolor: 'var(--hover-bg)' } : {},
                 }}
               >
                 <StatusIcon
                   cancelled={cancelled}
+                  isRejected={isRejected}
                   state={
-                    (tool.toolName === 'hf_jobs' && jobMeta.jobStatus && ['ERROR', 'FAILED', 'CANCELLED'].includes(jobMeta.jobStatus) && displayState === 'output-available')
+                    hasError
                       ? 'output-error'
-                      : displayState as ToolPartState
+                      : ((tool.toolName === 'hf_jobs' && jobMeta.jobStatus && ['ERROR', 'FAILED', 'CANCELLED'].includes(jobMeta.jobStatus))
+                        ? 'output-error'
+                        : displayState as ToolPartState)
                   }
                 />
 
@@ -715,23 +970,37 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                 </Typography>
 
                 {/* Status chip (non hf_jobs, or hf_jobs without final status) */}
-                {label && !(tool.toolName === 'hf_jobs' && jobMeta.jobStatus) && (
-                  <Chip
-                    label={label}
-                    size="small"
-                    sx={{
-                      height: 20,
-                      fontSize: '0.65rem',
-                      fontWeight: 600,
-                      bgcolor: cancelled ? 'rgba(255,255,255,0.05)'
-                        : displayState === 'output-error' ? 'rgba(224,90,79,0.12)'
-                        : displayState === 'output-denied' ? 'rgba(255,255,255,0.05)'
-                        : 'var(--accent-yellow-weak)',
-                      color: cancelled ? 'var(--muted-text)' : statusColor(displayState as ToolPartState),
-                      letterSpacing: '0.03em',
-                    }}
-                  />
-                )}
+                {(() => {
+                  // Research tool: override chip label with live stats (but not if cancelled/done)
+                  const researchDone = cancelled || state === 'output-available' || state === 'output-error' || state === 'output-denied';
+                  const researchLabel = tool.toolName === 'research' && !researchDone
+                    ? researchChipLabel(researchStats, liveElapsed)
+                    : (tool.toolName === 'research' && researchDone && researchStats.finalElapsed !== null)
+                      ? researchChipLabel({ ...researchStats, startedAt: null }, null)
+                      : null;
+                  const chipLabel = researchLabel || label;
+                  if (!chipLabel || (tool.toolName === 'hf_jobs' && jobMeta.jobStatus)) return null;
+
+                  return (
+                    <Chip
+                      label={chipLabel}
+                      size="small"
+                      sx={{
+                        height: 20,
+                        fontSize: '0.65rem',
+                        fontWeight: 600,
+                        bgcolor: (cancelled || isRejected) ? 'rgba(255,255,255,0.05)'
+                          : hasError ? 'rgba(224,90,79,0.12)'
+                          : (researchLabel && displayState === 'output-available') ? 'rgba(47,204,113,0.12)'
+                          : 'var(--accent-yellow-weak)',
+                        color: (cancelled || isRejected) ? 'var(--muted-text)'
+                          : hasError ? 'var(--accent-red)'
+                          : statusColor(displayState as ToolPartState),
+                        letterSpacing: '0.03em',
+                      }}
+                    />
+                  );
+                })()}
 
                 {/* HF Jobs: final status chip from job metadata */}
                 {tool.toolName === 'hf_jobs' && jobMeta.jobStatus && (
@@ -785,11 +1054,11 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                 )}
               </Stack>
 
-              {/* Research sub-agent steps */}
-              {tool.toolName === 'research' && researchSteps.length > 0 && (
+              {/* Research sub-agent rolling steps (visible only while running) */}
+              {tool.toolName === 'research' && !cancelled && state !== 'output-available' && state !== 'output-error' && state !== 'output-denied' && (
                 <ResearchSteps
                   steps={researchSteps}
-                  isRunning={state === 'input-streaming' || state === 'input-available'}
+                  isRunning={researchStats.startedAt !== null}
                 />
               )}
 
