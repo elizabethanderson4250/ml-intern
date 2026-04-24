@@ -152,6 +152,32 @@ Anything speculative — do not post:
   and the tool block must stay intact. Breaking the cache silently is P0 (cost
   regression).
 
+## Dependency PRs
+
+PRs whose diff is a lockfile bump (`uv.lock`, `package-lock.json`), a
+`pyproject.toml` version change, or a new dependency need a different check
+than code-behavior PRs. The code rules above mostly don't apply; the risks
+shift to provenance, supply chain, and framing. For these:
+
+- **Verify claimed CVEs.** If the PR body or title references a CVE ID, the
+  CVE must resolve in the NVD (nvd.nist.gov) or the GitHub Advisory Database
+  (github.com/advisories). If you cannot find the CVE, flag as P0 — fabricated
+  CVE IDs are a known supply-chain attack pattern and merging lends them a
+  false audit trail.
+- **Title version must match the lockfile diff.** If the title says "upgrade X
+  to 1.6.9" but the lockfile shows `1.5.0 → 1.7.0`, the PR is mislabeled or
+  doing more than it claims. Mismatch is P0 regardless of whether the bump
+  itself is safe — future maintainers grepping the commit history for the
+  stated version will be misled.
+- **Explain any new transitive deps.** If the lockfile bump pulls in a package
+  that was not previously present, the PR body must name it and justify it.
+  Unexplained new transitive deps — especially from authors with no prior
+  contributions to the repo — are P0 supply-chain risk. Do not approve.
+- **No code-behavior claims without code changes.** If a dep-only PR claims to
+  "fix" a specific bug, "add" a feature, or "patch" a vulnerability that would
+  require source changes to verify, the claim is false. Flag the framing as P0
+  and note that the dep bump itself may still be fine in isolation.
+
 ## Verification bar
 
 Every behavior claim in a finding must cite `file:line`. "This breaks X" is not
