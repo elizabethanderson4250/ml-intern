@@ -18,19 +18,54 @@ Every finding carries one of three priority labels:
 Write labels as plain text (`P0`, `P1`, `P2`) in finding headers. Do not use
 emoji or colored markers.
 
-## Default bias: merge
+## Default bias: rigor
 
-The goal of review is to catch things that would break production or leak cost,
-not to gate every PR on a round trip. **Default bias is to merge.** Only P0
-findings read as "fix before merge." P1 and P2 are informational — the author
-may defer them to a follow-up issue or a "fix-it" pass at their discretion, and
-the review should not frame them as required changes.
+Reviews gate merges. This is an open-source repo that takes PRs from anyone; the
+maintainer team is small and relies on the review to catch what they don't have
+time to verify themselves. **Default bias is rigor, not speed.** When in doubt
+on a P0-class concern, investigate further before deciding whether to flag — a
+false negative ships a bug to production, a false positive costs the contributor
+one round trip.
 
-If the author pushes back on a P1 or P2 without fixing it, accept the pushback —
-do not re-flag it on subsequent commits. If Claude and the author repeatedly
-disagree on the same class of finding, the signal is that REVIEW.md is missing a
-rule; note it once in the PR summary as `suggest-rule: <short description>` and
-stop.
+Rigor is not nitpicking. The P1 cap, "do not report" skip list, and verification
+bar all still apply. Rigor means going deep on a small number of real concerns,
+not surfacing a large number of shallow ones. Prefer one well-investigated P0
+over three speculative P1s.
+
+**Hold the line on P0.** If the author pushes back on a P0 finding without a fix
+that actually addresses the root cause, re-state the concern with added
+citations. Only accept the pushback if the author points to code or behavior you
+missed. Do not soften a P0 because the contributor is polite or new to the repo.
+
+For P1 and P2: if the author defers or pushes back without fixing, accept it
+silently — do not re-flag on subsequent commits. P1/P2 are informational; the
+author may defer to a follow-up issue at their discretion.
+
+If Claude and the author repeatedly disagree on the same class of finding, the
+signal is that REVIEW.md is missing a rule; note it once in the PR summary as
+`suggest-rule: <short description>` and stop.
+
+## Investigate before posting
+
+The depth of your analysis determines the strength of your finding. For any
+P0-class concern, before writing it up:
+
+- Read the relevant callers and callees, not just the diff. Use Read and Grep
+  to open files the diff doesn't touch but the changed code interacts with.
+- Trace the full chain end-to-end for routing, auth, and agent-loop findings.
+  Cite each hop by `file:line`, not just the suspicious line.
+- Check whether the codebase already has an established pattern for this kind
+  of change (`grep` for similar call sites, similar tool definitions, similar
+  route guards). If the PR introduces a new approach where an established
+  pattern exists, flag that — divergence from the existing pattern is usually a
+  regression vector even when the new code "works."
+- Confirm the specific behavior you're claiming. "This breaks X" must be
+  grounded in either the code handling X or a test exercising X, not in
+  inference from naming or structure.
+
+A finding you "spotted" by scanning the diff is more likely to be a false
+positive than a finding you verified by reading the code around it. If you
+cannot invest the depth to verify, do not post the finding.
 
 ## What counts as P0 in this repo
 
@@ -129,15 +164,30 @@ author can verify the chain end-to-end.
 
 ## Summary shape
 
-Open the review body with a single-line tally:
+Open the review body with a single-line tally and an explicit merge verdict, on
+two lines:
 
-- `2 P0, 3 P1` if both, or
-- `No blocking issues — 3 P1` if no P0, or
-- `LGTM` if nothing at all.
+```
+2 P0, 3 P1
+Verdict: changes requested
+```
+
+Valid verdicts:
+
+- **Verdict: ready to merge** — no P0 findings, contributor can merge as-is
+  once any CI passes
+- **Verdict: changes requested** — at least one P0 that must be addressed
+  before merging
+- **Verdict: needs discussion** — a design-level concern the maintainer should
+  weigh in on before the contributor iterates (use sparingly)
+
+If it's a clean review, write `LGTM` followed by `Verdict: ready to merge`.
 
 Then a **What I checked** bullet list — one line per major area you examined,
-regardless of whether you found anything. This gives the author visible coverage
-even on a clean review, so "LGTM" carries weight instead of looking like a skim.
+regardless of whether you found anything. This gives the maintainer visible
+coverage at a glance and lets them decide whether to spot-check areas you
+didn't touch.
+
 Example:
 
 > What I checked:
